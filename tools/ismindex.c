@@ -19,34 +19,46 @@
  */
 
 /*
- * This tool is based on ismindex written by Martin Storsjo as part of FFmpeg.
- * The tool will read an ismv or isma file and output the moof offsets to a file.
+ * To create a simple file for smooth streaming:
+ * ffmpeg <normal input/transcoding options> -movflags frag_keyframe foo.ismv
+ * ismindex -n foo foo.ismv
+ * This step creates foo.ism and foo.ismc that is required by IIS for
+ * serving it.
  *
- * moof_mapper -map foo.ismf -path-prefix bar -output out a.ismv b.ismv c.isma
- * This reads a.ismv, b.ismv and c.isma from directory bar/.
- * The moof offset map file is written to out/ with name foo.ismf
+ * With -ismf, it also creates foo.ismf, which maps fragment names to
+ * start-end offsets in the ismv, for use in your own streaming server.
  *
- * -map is the name of the output file.
- *  By default moof_map.ismf
+ * By adding -path-prefix path/, the produced foo.ism will refer to the
+ * files foo.ismv as "path/foo.ismv" - the prefix for the generated ismc
+ * file can be set with the -ismc-prefix option similarly.
  *
- * -path-prefix is used to specify the base path of the input files.
- * This makes it possible to only specify the file name for the input files.
+ * To pre-split files for serving as static files by a web server without
+ * any extra server support, create the ismv file as above, and split it:
+ * ismindex -split foo.ismv
+ * This step creates a file Manifest and directories QualityLevel(...),
+ * that can be read directly by a smooth streaming player.
  *
- * -output dir option specifies the output directory.
- * By default the current directory is used.
+ * The -output dir option can be used to request that output files
+ * (both .ism/.ismc, or Manifest/QualityLevels* when splitting)
+ * should be written to this directory instead of in the current directory.
+ * (The directory itself isn't created if it doesn't already exist.)
  */
 
 #include <stdio.h>
 #include <string.h>
 
+#include "cmdutils.h"
+
 #include "libavformat/avformat.h"
 #include "libavformat/isom.h"
+#include "libavformat/os_support.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mathematics.h"
 
 static int usage(const char *argv0, int ret)
 {
-    fprintf(stderr, "%s [-map moof-map-name] [-path-prefix prefix] "
-                    "[-output dir] file1 [file2] ...\n", argv0);
+    fprintf(stderr, "%s [-split] [-ismf] [-n basename] [-path-prefix prefix] "
+                    "[-ismc-prefix prefix] [-output dir] file1 [file2] ...\n", argv0);
     return ret;
 }
 
@@ -62,13 +74,24 @@ struct Track {
     int bitrate;
     int track_id;
     int is_audio, is_video;
+    int width, height;
     int chunks;
+    int sample_rate, channels;
+    uint8_t *codec_private;
+    int codec_private_size;
     struct MoofOffset *offsets;
+    int timescale;
+    const char *fourcc;
+    int blocksize;
+    int tag;
 };
 
 struct Tracks {
     int nb_tracks;
+    int64_t duration;
     struct Track **tracks;
+    int video_track, audio_track;
+    int nb_video_tracks, nb_audio_tracks;
 };
 
 static int expect_tag(int32_t got_tag, int32_t expected_tag) {
@@ -79,6 +102,31 @@ static int expect_tag(int32_t got_tag, int32_t expected_tag) {
         fprintf(stderr, "wanted tag %.4s, got %.4s\n", expected_tag_str,
                 got_tag_str);
         return -1;
+    }
+    return 0;
+}
+
+static int copy_tag(AVIOContext *in, AVIOContext *out, int32_t tag_name)
+{
+    int32_t size, tag;
+
+    size = avio_rb32(in);
+    tag  = avio_rb32(in);
+    avio_wb32(out, size);
+    avio_wb32(out, tag);
+    if (expect_tag(tag, tag_name) != 0)
+        return -1;
+    size -= 8;
+    while (size > 0) {
+        char buf[1024];
+        int len = FFMIN(sizeof(buf), size);
+        int got;
+        if ((got = avio_read(in, buf, len)) != len) {
+            fprintf(stderr, "short read, wanted %d, got %d\n", len, got);
+            break;
+        }
+        avio_write(out, buf, len);
+        size -= len;
     }
     return 0;
 }
@@ -96,6 +144,27 @@ static int skip_tag(AVIOContext *in, int32_t tag_name)
     return 0;
 }
 
+static int write_fragment(const char *filename, AVIOContext *in)
+{
+    AVIOContext *out = NULL;
+    int ret;
+
+    if ((ret = avio_open2(&out, filename, AVIO_FLAG_WRITE, NULL, NULL)) < 0) {
+        char errbuf[100];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Unable to open %s: %s\n", filename, errbuf);
+        return ret;
+    }
+    ret = copy_tag(in, out, MKBETAG('m', 'o', 'o', 'f'));
+    if (!ret)
+        ret = copy_tag(in, out, MKBETAG('m', 'd', 'a', 't'));
+
+    avio_flush(out);
+    avio_close(out);
+
+    return ret;
+}
+
 static int skip_fragment(AVIOContext *in)
 {
     int ret;
@@ -105,25 +174,46 @@ static int skip_fragment(AVIOContext *in)
     return ret;
 }
 
-static int write_fragment_map(struct Tracks *tracks, int start_index, AVIOContext *in, FILE *out)
+static int write_fragments(struct Tracks *tracks, int start_index,
+                           AVIOContext *in, const char *basename,
+                           int split, int ismf, const char* output_prefix)
 {
+    char dirname[2048], filename[2048], idxname[2048];
     int i, j, ret = 0, fragment_ret;
-    char qualitylevel_str[2048];
+    FILE* out = NULL;
 
+    if (ismf) {
+        snprintf(idxname, sizeof(idxname), "%s%s.ismf", output_prefix, basename);
+        out = fopen(idxname, "w");
+        if (!out) {
+            ret = AVERROR(errno);
+            perror(idxname);
+            goto fail;
+        }
+    }
     for (i = start_index; i < tracks->nb_tracks; i++) {
         struct Track *track = tracks->tracks[i];
         const char *type    = track->is_video ? "video" : "audio";
-        snprintf(qualitylevel_str, sizeof(qualitylevel_str), "QualityLevels(%d)", track->bitrate);
-
+        snprintf(dirname, sizeof(dirname), "%sQualityLevels(%d)", output_prefix, track->bitrate);
+        if (split) {
+            if (mkdir(dirname, 0777) == -1 && errno != EEXIST) {
+                ret = AVERROR(errno);
+                perror(dirname);
+                goto fail;
+            }
+        }
         for (j = 0; j < track->chunks; j++) {
+            snprintf(filename, sizeof(filename), "%s/Fragments(%s=%"PRId64")",
+                     dirname, type, track->offsets[j].time);
             avio_seek(in, track->offsets[j].offset, SEEK_SET);
-            fprintf(out, "%s/Fragments(%s=%"PRId64") %"PRId64,
-                    qualitylevel_str, type, track->offsets[j].time,
-                    avio_tell(in));
-
-            fragment_ret = skip_fragment(in);
-
-            fprintf(out, " %"PRId64"\n", avio_tell(in));
+            if (ismf)
+                fprintf(out, "%s %"PRId64, filename, avio_tell(in));
+            if (split)
+                fragment_ret = write_fragment(filename, in);
+            else
+                fragment_ret = skip_fragment(in);
+            if (ismf)
+                fprintf(out, " %"PRId64"\n", avio_tell(in));
             if (fragment_ret != 0) {
                 fprintf(stderr, "failed fragment %d in track %d (%s)\n", j,
                         track->track_id, track->name);
@@ -131,7 +221,9 @@ static int write_fragment_map(struct Tracks *tracks, int start_index, AVIOContex
             }
         }
     }
-
+fail:
+    if (out)
+        fclose(out);
     return ret;
 }
 
@@ -162,7 +254,7 @@ static int64_t read_trun_duration(AVIOContext *in, int default_duration,
         if (flags & MOV_TRUN_SAMPLE_DURATION) sample_duration = avio_rb32(in);
         if (flags & MOV_TRUN_SAMPLE_SIZE)     avio_rb32(in);
         if (flags & MOV_TRUN_SAMPLE_FLAGS)    avio_rb32(in);
-        if (flags & MOV_TRUN_SAMPLE_CTS)      pts += (int32_t)avio_rb32(in);
+        if (flags & MOV_TRUN_SAMPLE_CTS)      pts += avio_rb32(in);
         if (sample_duration < 0) {
             fprintf(stderr, "Negative sample duration %d\n", sample_duration);
             return -1;
@@ -320,14 +412,17 @@ fail:
     return ret;
 }
 
-static int read_mfra(struct Tracks *tracks, int start_index, AVIOContext *f)
+static int read_mfra(struct Tracks *tracks, int start_index,
+                     const char *file, int split, int ismf,
+                     const char *basename, const char* output_prefix)
 {
     int err = 0;
     const char* err_str = "";
+    AVIOContext *f = NULL;
     int32_t mfra_size;
 
-    printf("Entered read_mfra with index %d\n", start_index);
-
+    if ((err = avio_open2(&f, file, AVIO_FLAG_READ, NULL, NULL)) < 0)
+        goto fail;
     avio_seek(f, avio_size(f) - 4, SEEK_SET);
     mfra_size = avio_rb32(f);
     avio_seek(f, -mfra_size, SEEK_CUR);
@@ -345,25 +440,71 @@ static int read_mfra(struct Tracks *tracks, int start_index, AVIOContext *f)
         /* Empty */
     }
 
+    if (split || ismf)
+        err = write_fragments(tracks, start_index, f, basename, split, ismf,
+                              output_prefix);
+    err_str = "error in write_fragments";
+
 fail:
+    if (f)
+        avio_close(f);
     if (err)
-        fprintf(stderr, "Unable to read the MFRA atom (%s)\n", err_str);
+        fprintf(stderr, "Unable to read the MFRA atom in %s (%s)\n", file, err_str);
     return err;
 }
 
-static int handle_file(struct Tracks *tracks, const char *path_prefix, const char *file, FILE *out)
+static int get_private_data(struct Track *track, AVCodecParameters *codecpar)
+{
+    track->codec_private_size = 0;
+    track->codec_private      = av_mallocz(codecpar->extradata_size);
+    if (!track->codec_private)
+        return AVERROR(ENOMEM);
+    track->codec_private_size = codecpar->extradata_size;
+    memcpy(track->codec_private, codecpar->extradata, codecpar->extradata_size);
+    return 0;
+}
+
+static int get_video_private_data(struct Track *track, AVCodecParameters *codecpar)
+{
+    AVIOContext *io = NULL;
+    uint16_t sps_size, pps_size;
+    int err;
+
+    if (codecpar->codec_id == AV_CODEC_ID_VC1)
+        return get_private_data(track, codecpar);
+
+    if ((err = avio_open_dyn_buf(&io)) < 0)
+        goto fail;
+    err = AVERROR(EINVAL);
+    if (codecpar->extradata_size < 11 || codecpar->extradata[0] != 1)
+        goto fail;
+    sps_size = AV_RB16(&codecpar->extradata[6]);
+    if (11 + sps_size > codecpar->extradata_size)
+        goto fail;
+    avio_wb32(io, 0x00000001);
+    avio_write(io, &codecpar->extradata[8], sps_size);
+    pps_size = AV_RB16(&codecpar->extradata[9 + sps_size]);
+    if (11 + sps_size + pps_size > codecpar->extradata_size)
+        goto fail;
+    avio_wb32(io, 0x00000001);
+    avio_write(io, &codecpar->extradata[11 + sps_size], pps_size);
+    err = 0;
+
+fail:
+    track->codec_private_size = avio_close_dyn_buf(io, &track->codec_private);
+    return err;
+}
+
+static int handle_file(struct Tracks *tracks, const char *file, int split,
+                       int ismf, const char *basename,
+                       const char* output_prefix)
 {
     AVFormatContext *ctx = NULL;
     int err = 0, i, orig_tracks = tracks->nb_tracks;
     char errbuf[50], *ptr;
     struct Track *track;
-    AVIOContext *f = NULL;
-    char file_buf[PATH_MAX];
 
-    printf("Entered handle_file with file: %s\n", file);
-
-    snprintf(file_buf, sizeof(file_buf), "%s%s", path_prefix, file);
-    err = avformat_open_input(&ctx, file_buf, NULL, NULL);
+    err = avformat_open_input(&ctx, file, NULL, NULL);
     if (err < 0) {
         av_strerror(err, errbuf, sizeof(errbuf));
         fprintf(stderr, "Unable to open %s: %s\n", file, errbuf);
@@ -383,8 +524,6 @@ static int handle_file(struct Tracks *tracks, const char *path_prefix, const cha
     }
 
     for (i = 0; i < ctx->nb_streams; i++) {
-        printf("Looping in handle_file with i %d\n", i);
-
         struct Track **temp;
         AVStream *st = ctx->streams[i];
 
@@ -416,6 +555,7 @@ static int handle_file(struct Tracks *tracks, const char *path_prefix, const cha
 
         track->bitrate   = st->codecpar->bit_rate;
         track->track_id  = st->id;
+        track->timescale = st->time_base.den;
         track->duration  = st->duration;
         track->is_audio  = st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
         track->is_video  = st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
@@ -428,40 +568,215 @@ static int handle_file(struct Tracks *tracks, const char *path_prefix, const cha
             continue;
         }
 
+        tracks->duration = FFMAX(tracks->duration,
+                                 av_rescale_rnd(track->duration, AV_TIME_BASE,
+                                                track->timescale, AV_ROUND_UP));
+
+        if (track->is_audio) {
+            if (tracks->audio_track < 0)
+                tracks->audio_track = tracks->nb_tracks;
+            tracks->nb_audio_tracks++;
+            track->channels    = st->codecpar->channels;
+            track->sample_rate = st->codecpar->sample_rate;
+            if (st->codecpar->codec_id == AV_CODEC_ID_AAC) {
+                track->fourcc    = "AACL";
+                track->tag       = 255;
+                track->blocksize = 4;
+            } else if (st->codecpar->codec_id == AV_CODEC_ID_WMAPRO) {
+                track->fourcc    = "WMAP";
+                track->tag       = st->codecpar->codec_tag;
+                track->blocksize = st->codecpar->block_align;
+            }
+            get_private_data(track, st->codecpar);
+        }
+        if (track->is_video) {
+            if (tracks->video_track < 0)
+                tracks->video_track = tracks->nb_tracks;
+            tracks->nb_video_tracks++;
+            track->width  = st->codecpar->width;
+            track->height = st->codecpar->height;
+            if (st->codecpar->codec_id == AV_CODEC_ID_H264)
+                track->fourcc = "H264";
+            else if (st->codecpar->codec_id == AV_CODEC_ID_VC1)
+                track->fourcc = "WVC1";
+            get_video_private_data(track, st->codecpar);
+        }
+
         tracks->nb_tracks++;
     }
 
     avformat_close_input(&ctx);
 
-    if ((err = avio_open2(&f, file_buf, AVIO_FLAG_READ, NULL, NULL)) < 0) {
-        fprintf(stderr, "error when opening the file\n");
-        goto fail;
-    }
-
-    err = read_mfra(tracks, orig_tracks, f);
-    if (err < 0) {
-        goto fail;
-    }
-
-    err = write_fragment_map(tracks, orig_tracks, f, out);
-    if (err < 0) {
-        fprintf(stderr, "error in write_fragment_map\n");
-        goto fail;
-    }
+    err = read_mfra(tracks, orig_tracks, file, split, ismf, basename,
+                    output_prefix);
 
 fail:
-    if (f)
-        avio_close(f);
-
     if (ctx)
         avformat_close_input(&ctx);
     return err;
+}
+
+static void output_server_manifest(struct Tracks *tracks, const char *basename,
+                                   const char *output_prefix,
+                                   const char *path_prefix,
+                                   const char *ismc_prefix)
+{
+    char filename[1000];
+    FILE *out;
+    int i;
+
+    snprintf(filename, sizeof(filename), "%s%s.ism", output_prefix, basename);
+    out = fopen(filename, "w");
+    if (!out) {
+        perror(filename);
+        return;
+    }
+    fprintf(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    fprintf(out, "<smil xmlns=\"http://www.w3.org/2001/SMIL20/Language\">\n");
+    fprintf(out, "\t<head>\n");
+    fprintf(out, "\t\t<meta name=\"clientManifestRelativePath\" "
+                 "content=\"%s%s.ismc\" />\n", ismc_prefix, basename);
+    fprintf(out, "\t</head>\n");
+    fprintf(out, "\t<body>\n");
+    fprintf(out, "\t\t<switch>\n");
+    for (i = 0; i < tracks->nb_tracks; i++) {
+        struct Track *track = tracks->tracks[i];
+        const char *type    = track->is_video ? "video" : "audio";
+        fprintf(out, "\t\t\t<%s src=\"%s%s\" systemBitrate=\"%d\">\n",
+                type, path_prefix, track->name, track->bitrate);
+        fprintf(out, "\t\t\t\t<param name=\"trackID\" value=\"%d\" "
+                     "valueType=\"data\" />\n", track->track_id);
+        fprintf(out, "\t\t\t</%s>\n", type);
+    }
+    fprintf(out, "\t\t</switch>\n");
+    fprintf(out, "\t</body>\n");
+    fprintf(out, "</smil>\n");
+    fclose(out);
+}
+
+static void print_track_chunks(FILE *out, struct Tracks *tracks, int main,
+                               const char *type)
+{
+    int i, j;
+    int64_t pos = 0;
+    struct Track *track = tracks->tracks[main];
+    int should_print_time_mismatch = 1;
+
+    for (i = 0; i < track->chunks; i++) {
+        for (j = main + 1; j < tracks->nb_tracks; j++) {
+            if (tracks->tracks[j]->is_audio == track->is_audio) {
+                if (track->offsets[i].duration != tracks->tracks[j]->offsets[i].duration) {
+                    fprintf(stderr, "Mismatched duration of %s chunk %d in %s (%d) and %s (%d)\n",
+                            type, i, track->name, main, tracks->tracks[j]->name, j);
+                    should_print_time_mismatch = 1;
+                }
+                if (track->offsets[i].time != tracks->tracks[j]->offsets[i].time) {
+                    if (should_print_time_mismatch)
+                        fprintf(stderr, "Mismatched (start) time of %s chunk %d in %s (%d) and %s (%d)\n",
+                                type, i, track->name, main, tracks->tracks[j]->name, j);
+                    should_print_time_mismatch = 0;
+                }
+            }
+        }
+        fprintf(out, "\t\t<c n=\"%d\" d=\"%"PRId64"\" ",
+                i, track->offsets[i].duration);
+        if (pos != track->offsets[i].time) {
+            fprintf(out, "t=\"%"PRId64"\" ", track->offsets[i].time);
+            pos = track->offsets[i].time;
+        }
+        pos += track->offsets[i].duration;
+        fprintf(out, "/>\n");
+    }
+}
+
+static void output_client_manifest(struct Tracks *tracks, const char *basename,
+                                   const char *output_prefix, int split)
+{
+    char filename[1000];
+    FILE *out;
+    int i, j;
+
+    if (split)
+        snprintf(filename, sizeof(filename), "%sManifest", output_prefix);
+    else
+        snprintf(filename, sizeof(filename), "%s%s.ismc", output_prefix, basename);
+    out = fopen(filename, "w");
+    if (!out) {
+        perror(filename);
+        return;
+    }
+    fprintf(out, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    fprintf(out, "<SmoothStreamingMedia MajorVersion=\"2\" MinorVersion=\"0\" "
+                 "Duration=\"%"PRId64 "\">\n", tracks->duration * 10);
+    if (tracks->video_track >= 0) {
+        struct Track *track = tracks->tracks[tracks->video_track];
+        struct Track *first_track = track;
+        int index = 0;
+        fprintf(out,
+                "\t<StreamIndex Type=\"video\" QualityLevels=\"%d\" "
+                "Chunks=\"%d\" "
+                "Url=\"QualityLevels({bitrate})/Fragments(video={start time})\">\n",
+                tracks->nb_video_tracks, track->chunks);
+        for (i = 0; i < tracks->nb_tracks; i++) {
+            track = tracks->tracks[i];
+            if (!track->is_video)
+                continue;
+            fprintf(out,
+                    "\t\t<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
+                    "FourCC=\"%s\" MaxWidth=\"%d\" MaxHeight=\"%d\" "
+                    "CodecPrivateData=\"",
+                    index, track->bitrate, track->fourcc, track->width, track->height);
+            for (j = 0; j < track->codec_private_size; j++)
+                fprintf(out, "%02X", track->codec_private[j]);
+            fprintf(out, "\" />\n");
+            index++;
+            if (track->chunks != first_track->chunks)
+                fprintf(stderr, "Mismatched number of video chunks in %s (id: %d, chunks %d) and %s (id: %d, chunks %d)\n",
+                        track->name, track->track_id, track->chunks, first_track->name, first_track->track_id, first_track->chunks);
+        }
+        print_track_chunks(out, tracks, tracks->video_track, "video");
+        fprintf(out, "\t</StreamIndex>\n");
+    }
+    if (tracks->audio_track >= 0) {
+        struct Track *track = tracks->tracks[tracks->audio_track];
+        struct Track *first_track = track;
+        int index = 0;
+        fprintf(out,
+                "\t<StreamIndex Type=\"audio\" QualityLevels=\"%d\" "
+                "Chunks=\"%d\" "
+                "Url=\"QualityLevels({bitrate})/Fragments(audio={start time})\">\n",
+                tracks->nb_audio_tracks, track->chunks);
+        for (i = 0; i < tracks->nb_tracks; i++) {
+            track = tracks->tracks[i];
+            if (!track->is_audio)
+                continue;
+            fprintf(out,
+                    "\t\t<QualityLevel Index=\"%d\" Bitrate=\"%d\" "
+                    "FourCC=\"%s\" SamplingRate=\"%d\" Channels=\"%d\" "
+                    "BitsPerSample=\"16\" PacketSize=\"%d\" "
+                    "AudioTag=\"%d\" CodecPrivateData=\"",
+                    index, track->bitrate, track->fourcc, track->sample_rate,
+                    track->channels, track->blocksize, track->tag);
+            for (j = 0; j < track->codec_private_size; j++)
+                fprintf(out, "%02X", track->codec_private[j]);
+            fprintf(out, "\" />\n");
+            index++;
+            if (track->chunks != first_track->chunks)
+                fprintf(stderr, "Mismatched number of audio chunks in %s and %s\n",
+                        track->name, first_track->name);
+        }
+        print_track_chunks(out, tracks, tracks->audio_track, "audio");
+        fprintf(out, "\t</StreamIndex>\n");
+    }
+    fprintf(out, "</SmoothStreamingMedia>\n");
+    fclose(out);
 }
 
 static void clean_tracks(struct Tracks *tracks)
 {
     int i;
     for (i = 0; i < tracks->nb_tracks; i++) {
+        av_freep(&tracks->tracks[i]->codec_private);
         av_freep(&tracks->tracks[i]->offsets);
         av_freep(&tracks->tracks[i]);
     }
@@ -471,29 +786,25 @@ static void clean_tracks(struct Tracks *tracks)
 
 int main(int argc, char **argv)
 {
-    const char *mapname = "moof_map.ismf";
-    const char *path_prefix = "";
-    char path_prefix_buf[PATH_MAX];
+    const char *basename = NULL;
+    const char *path_prefix = "", *ismc_prefix = "";
     const char *output_prefix = "";
-    char output_prefix_buf[PATH_MAX];
-    int i;
-    struct Tracks tracks = { 0 };
-    FILE *out = NULL;
+    char output_prefix_buf[2048];
+    int split = 0, ismf = 0, i;
+    struct Tracks tracks = { 0, .video_track = -1, .audio_track = -1 };
 
     av_register_all();
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-map")) {
-            mapname = argv[i + 1];
+        if (!strcmp(argv[i], "-n")) {
+            basename = argv[i + 1];
             i++;
         } else if (!strcmp(argv[i], "-path-prefix")) {
             path_prefix = argv[i + 1];
             i++;
-            if (path_prefix[strlen(path_prefix) - 1] != '/') {
-                snprintf(path_prefix_buf, sizeof(path_prefix_buf),
-                         "%s/", path_prefix);
-                path_prefix = path_prefix_buf;
-            }
+        } else if (!strcmp(argv[i], "-ismc-prefix")) {
+            ismc_prefix = argv[i + 1];
+            i++;
         } else if (!strcmp(argv[i], "-output")) {
             output_prefix = argv[i + 1];
             i++;
@@ -502,31 +813,27 @@ int main(int argc, char **argv)
                          "%s/", output_prefix);
                 output_prefix = output_prefix_buf;
             }
+        } else if (!strcmp(argv[i], "-split")) {
+            split = 1;
+        } else if (!strcmp(argv[i], "-ismf")) {
+            ismf = 1;
         } else if (argv[i][0] == '-') {
             return usage(argv[0], 1);
         } else {
-            if (out == NULL) {
-                char idxname[PATH_MAX];
-                snprintf(idxname, sizeof(idxname), "%s%s", output_prefix, mapname);
-                out = fopen(idxname, "a");
-                if (!out) {
-                    perror(idxname);
-                    return 1;
-                }
-            }
-
-            if (handle_file(&tracks, path_prefix, argv[i], out)) {
+            if (!basename)
+                ismf = 0;
+            if (handle_file(&tracks, argv[i], split, ismf,
+                            basename, output_prefix))
                 return 1;
-            }
         }
     }
-
-    if (out)
-        fclose(out);
-
-    if (!tracks.nb_tracks) {
+    if (!tracks.nb_tracks || (!basename && !split))
         return usage(argv[0], 1);
-    }
+
+    if (!split)
+        output_server_manifest(&tracks, basename, output_prefix,
+                               path_prefix, ismc_prefix);
+    output_client_manifest(&tracks, basename, output_prefix, split);
 
     clean_tracks(&tracks);
 
