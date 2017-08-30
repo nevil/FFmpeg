@@ -19,37 +19,34 @@
  */
 
 /*
- * To create a simple file for smooth streaming:
- * ffmpeg <normal input/transcoding options> -movflags frag_keyframe foo.ismv
- * ismindex -n foo foo.ismv
- * This step creates foo.ism and foo.ismc that is required by IIS for
- * serving it.
+ * This tool is based on ismindex written by Martin Storsjo as part of FFmpeg.
+ * The tool will read an ismv or isma file and output the moof offsets to a file.
  *
- * By adding -path-prefix path/, the produced foo.ism will refer to the
- * files foo.ismv as "path/foo.ismv" - the prefix for the generated ismc
- * file can be set with the -ismc-prefix option similarly.
+ * moof_mapper -map foo.ismf -path-prefix bar -output out a.ismv b.ismv c.isma
+ * This reads a.ismv, b.ismv and c.isma from directory bar/.
+ * The moof offset map file is written to out/ with name foo.ismf
  *
- * The -output dir option can be used to request that output files
- * (both .ism/.ismc)
- * should be written to this directory instead of in the current directory.
- * (The directory itself isn't created if it doesn't already exist.)
+ * -map is the name of the output file.
+ *  By default moof_map.ismf
+ *
+ * -path-prefix is used to specify the base path of the input files.
+ * This makes it possible to only specify the file name for the input files.
+ *
+ * -output dir option specifies the output directory.
+ * By default the current directory is used.
  */
 
 #include <stdio.h>
 #include <string.h>
 
-#include "cmdutils.h"
-
 #include "libavformat/avformat.h"
 #include "libavformat/isom.h"
-#include "libavformat/os_support.h"
 #include "libavutil/intreadwrite.h"
-#include "libavutil/mathematics.h"
 
 static int usage(const char *argv0, int ret)
 {
-    fprintf(stderr, "%s [-n basename] [-path-prefix prefix] "
-                    "[-ismc-prefix prefix] [-output dir] file1 [file2] ...\n", argv0);
+    fprintf(stderr, "%s [-map moof-map-name] [-path-prefix prefix] "
+                    "[-output dir] file1 [file2] ...\n", argv0);
     return ret;
 }
 
@@ -108,32 +105,21 @@ static int skip_fragment(AVIOContext *in)
     return ret;
 }
 
-static int write_fragments(struct Tracks *tracks, int start_index,
-                           AVIOContext *in, const char *basename,
-                           const char* output_prefix)
+static int write_fragment_map(struct Tracks *tracks, int start_index, AVIOContext *in, FILE *out)
 {
-    char dirname[2048], filename[2048], idxname[2048];
     int i, j, ret = 0, fragment_ret;
-    FILE* out = NULL;
-
-    snprintf(idxname, sizeof(idxname), "%s%s.ismf", output_prefix, basename);
-    out = fopen(idxname, "a");
-    if (!out) {
-        ret = AVERROR(errno);
-        perror(idxname);
-        goto fail;
-    }
+    char qualitylevel_str[2048];
 
     for (i = start_index; i < tracks->nb_tracks; i++) {
         struct Track *track = tracks->tracks[i];
         const char *type    = track->is_video ? "video" : "audio";
-        snprintf(dirname, sizeof(dirname), "QualityLevels(%d)", track->bitrate);
+        snprintf(qualitylevel_str, sizeof(qualitylevel_str), "QualityLevels(%d)", track->bitrate);
 
         for (j = 0; j < track->chunks; j++) {
-            snprintf(filename, sizeof(filename), "%s/Fragments(%s=%"PRId64")",
-                     dirname, type, track->offsets[j].time);
             avio_seek(in, track->offsets[j].offset, SEEK_SET);
-            fprintf(out, "%s %"PRId64, filename, avio_tell(in));
+            fprintf(out, "%s/Fragments(%s=%"PRId64") %"PRId64,
+                    qualitylevel_str, type, track->offsets[j].time,
+                    avio_tell(in));
 
             fragment_ret = skip_fragment(in);
 
@@ -145,9 +131,7 @@ static int write_fragments(struct Tracks *tracks, int start_index,
             }
         }
     }
-fail:
-    if (out)
-        fclose(out);
+
     return ret;
 }
 
@@ -336,17 +320,14 @@ fail:
     return ret;
 }
 
-static int read_mfra(struct Tracks *tracks, int start_index,
-                     const char *file,
-                     const char *basename, const char* output_prefix)
+static int read_mfra(struct Tracks *tracks, int start_index, AVIOContext *f)
 {
     int err = 0;
     const char* err_str = "";
-    AVIOContext *f = NULL;
     int32_t mfra_size;
 
-    if ((err = avio_open2(&f, file, AVIO_FLAG_READ, NULL, NULL)) < 0)
-        goto fail;
+    printf("Entered read_mfra with index %d\n", start_index);
+
     avio_seek(f, avio_size(f) - 4, SEEK_SET);
     mfra_size = avio_rb32(f);
     avio_seek(f, -mfra_size, SEEK_CUR);
@@ -364,28 +345,25 @@ static int read_mfra(struct Tracks *tracks, int start_index,
         /* Empty */
     }
 
-    err = write_fragments(tracks, start_index, f, basename,
-                          output_prefix);
-    err_str = "error in write_fragments";
-
 fail:
-    if (f)
-        avio_close(f);
     if (err)
-        fprintf(stderr, "Unable to read the MFRA atom in %s (%s)\n", file, err_str);
+        fprintf(stderr, "Unable to read the MFRA atom (%s)\n", err_str);
     return err;
 }
 
-static int handle_file(struct Tracks *tracks, const char *file,
-                       const char *basename,
-                       const char* output_prefix)
+static int handle_file(struct Tracks *tracks, const char *path_prefix, const char *file, FILE *out)
 {
     AVFormatContext *ctx = NULL;
     int err = 0, i, orig_tracks = tracks->nb_tracks;
     char errbuf[50], *ptr;
     struct Track *track;
+    AVIOContext *f = NULL;
+    char file_buf[PATH_MAX];
 
-    err = avformat_open_input(&ctx, file, NULL, NULL);
+    printf("Entered handle_file with file: %s\n", file);
+
+    snprintf(file_buf, sizeof(file_buf), "%s%s", path_prefix, file);
+    err = avformat_open_input(&ctx, file_buf, NULL, NULL);
     if (err < 0) {
         av_strerror(err, errbuf, sizeof(errbuf));
         fprintf(stderr, "Unable to open %s: %s\n", file, errbuf);
@@ -405,6 +383,8 @@ static int handle_file(struct Tracks *tracks, const char *file,
     }
 
     for (i = 0; i < ctx->nb_streams; i++) {
+        printf("Looping in handle_file with i %d\n", i);
+
         struct Track **temp;
         AVStream *st = ctx->streams[i];
 
@@ -453,10 +433,26 @@ static int handle_file(struct Tracks *tracks, const char *file,
 
     avformat_close_input(&ctx);
 
-    err = read_mfra(tracks, orig_tracks, file, basename,
-                    output_prefix);
+    if ((err = avio_open2(&f, file_buf, AVIO_FLAG_READ, NULL, NULL)) < 0) {
+        fprintf(stderr, "error when opening the file\n");
+        goto fail;
+    }
+
+    err = read_mfra(tracks, orig_tracks, f);
+    if (err < 0) {
+        goto fail;
+    }
+
+    err = write_fragment_map(tracks, orig_tracks, f, out);
+    if (err < 0) {
+        fprintf(stderr, "error in write_fragment_map\n");
+        goto fail;
+    }
 
 fail:
+    if (f)
+        avio_close(f);
+
     if (ctx)
         avformat_close_input(&ctx);
     return err;
@@ -475,22 +471,29 @@ static void clean_tracks(struct Tracks *tracks)
 
 int main(int argc, char **argv)
 {
-    const char *basename = NULL;
+    const char *mapname = "moof_map.ismf";
     const char *path_prefix = "";
+    char path_prefix_buf[PATH_MAX];
     const char *output_prefix = "";
-    char output_prefix_buf[2048];
+    char output_prefix_buf[PATH_MAX];
     int i;
     struct Tracks tracks = { 0 };
+    FILE *out = NULL;
 
     av_register_all();
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-n")) {
-            basename = argv[i + 1];
+        if (!strcmp(argv[i], "-map")) {
+            mapname = argv[i + 1];
             i++;
         } else if (!strcmp(argv[i], "-path-prefix")) {
             path_prefix = argv[i + 1];
             i++;
+            if (path_prefix[strlen(path_prefix) - 1] != '/') {
+                snprintf(path_prefix_buf, sizeof(path_prefix_buf),
+                         "%s/", path_prefix);
+                path_prefix = path_prefix_buf;
+            }
         } else if (!strcmp(argv[i], "-output")) {
             output_prefix = argv[i + 1];
             i++;
@@ -502,12 +505,26 @@ int main(int argc, char **argv)
         } else if (argv[i][0] == '-') {
             return usage(argv[0], 1);
         } else {
-            if (handle_file(&tracks, argv[i],
-                            basename, output_prefix))
+            if (out == NULL) {
+                char idxname[PATH_MAX];
+                snprintf(idxname, sizeof(idxname), "%s%s", output_prefix, mapname);
+                out = fopen(idxname, "a");
+                if (!out) {
+                    perror(idxname);
+                    return 1;
+                }
+            }
+
+            if (handle_file(&tracks, path_prefix, argv[i], out)) {
                 return 1;
+            }
         }
     }
-    if (!tracks.nb_tracks || !basename) {
+
+    if (out)
+        fclose(out);
+
+    if (!tracks.nb_tracks) {
         return usage(argv[0], 1);
     }
 
